@@ -91,6 +91,7 @@ class SparkCredentials(Credentials):
     retry_all: bool = False
     location_root: Optional[str] = None
     catalog: Optional[str] = None
+    quote_identifiers: bool = True  # Quote table/schema names to handle special characters
 
     @classmethod
     def __pre_deserialize__(cls, data: Any) -> Any:
