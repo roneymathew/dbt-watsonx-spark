@@ -56,6 +56,133 @@ logger = AdapterLogger("Spark")
 NUMBERS = DECIMALS + (int, float)
 
 
+class LoggingTHttpClient:
+    """Wrapper around THttpClient that logs HTTP requests and responses with detailed network info"""
+    
+    def __init__(self, transport):
+        self._transport = transport
+        self._request_count = 0
+        self._total_bytes_sent = 0
+        self._total_bytes_received = 0
+    
+    def __getattr__(self, name):
+        """Delegate all other attributes to the wrapped transport"""
+        return getattr(self._transport, name)
+    
+    def flush(self):
+        """Override flush to log HTTP request details"""
+        self._request_count += 1
+        logger.info("=" * 80)
+        logger.info("HTTP REQUEST #{} - STARTING".format(self._request_count))
+        logger.info("=" * 80)
+        
+        # Log request details if available
+        request_size = 0
+        if hasattr(self._transport, '_THttpClient__wbuf'):
+            wbuf = self._transport._THttpClient__wbuf
+            if hasattr(wbuf, 'getvalue'):
+                request_data = wbuf.getvalue()
+                request_size = len(request_data)
+                self._total_bytes_sent += request_size
+                logger.info("HTTP Request #{}: Payload size = {} bytes".format(self._request_count, request_size))
+                logger.info("HTTP Request #{}: Total bytes sent so far = {} bytes".format(
+                    self._request_count, self._total_bytes_sent))
+                
+                # Log first few bytes for debugging (hex format)
+                if request_size > 0:
+                    preview = request_data[:min(32, request_size)]
+                    hex_preview = ' '.join('{:02x}'.format(b) for b in preview)
+                    logger.debug("HTTP Request #{}: First {} bytes (hex): {}".format(
+                        self._request_count, len(preview), hex_preview))
+        
+        # Log transport state
+        if hasattr(self._transport, 'isOpen'):
+            logger.info("HTTP Request #{}: Transport open status = {}".format(
+                self._request_count, self._transport.isOpen()))
+        
+        try:
+            logger.info("HTTP Request #{}: Calling flush() to send data...".format(self._request_count))
+            result = self._transport.flush()
+            logger.info("HTTP Request #{}: ✓ Flush completed successfully".format(self._request_count))
+            logger.info("=" * 80)
+            return result
+        except EOFError as e:
+            logger.error("=" * 80)
+            logger.error("HTTP Request #{}: ✗ EOFError during flush()".format(self._request_count))
+            logger.error("HTTP Request #{}: Network connection closed by server during send".format(self._request_count))
+            logger.error("HTTP Request #{}: Bytes attempted to send: {}".format(self._request_count, request_size))
+            logger.error("HTTP Request #{}: This indicates network interruption during HTTP POST".format(self._request_count))
+            logger.error("=" * 80)
+            raise
+        except Exception as e:
+            logger.error("=" * 80)
+            logger.error("HTTP Request #{}: ✗ Error during flush: {} ({})".format(
+                self._request_count, str(e), type(e).__name__))
+            logger.error("=" * 80)
+            raise
+    
+    def read(self, sz):
+        """Override read to log HTTP response details"""
+        logger.info("-" * 80)
+        logger.info("HTTP RESPONSE #{} - READING {} BYTES".format(self._request_count, sz))
+        logger.info("-" * 80)
+        
+        # Log transport state before read
+        if hasattr(self._transport, 'isOpen'):
+            logger.info("HTTP Response #{}: Transport open status before read = {}".format(
+                self._request_count, self._transport.isOpen()))
+        
+        try:
+            logger.info("HTTP Response #{}: Calling read({}) to receive data...".format(self._request_count, sz))
+            data = self._transport.read(sz)
+            actual_size = len(data) if data else 0
+            self._total_bytes_received += actual_size
+            
+            logger.info("HTTP Response #{}: ✓ Successfully read {} bytes (requested {})".format(
+                self._request_count, actual_size, sz))
+            logger.info("HTTP Response #{}: Total bytes received so far = {} bytes".format(
+                self._request_count, self._total_bytes_received))
+            
+            if actual_size < sz:
+                logger.warning("HTTP Response #{}: ⚠ Partial read - received {} bytes but requested {}".format(
+                    self._request_count, actual_size, sz))
+                logger.warning("HTTP Response #{}: This may indicate connection closure or timeout".format(
+                    self._request_count))
+            
+            # Log first few bytes for debugging (hex format)
+            if actual_size > 0:
+                preview = data[:min(32, actual_size)]
+                hex_preview = ' '.join('{:02x}'.format(b) for b in preview)
+                logger.debug("HTTP Response #{}: First {} bytes (hex): {}".format(
+                    self._request_count, len(preview), hex_preview))
+            
+            logger.info("-" * 80)
+            return data
+        except EOFError as e:
+            logger.error("-" * 80)
+            logger.error("HTTP Response #{}: ✗ EOFError while reading".format(self._request_count))
+            logger.error("HTTP Response #{}: Expected {} bytes but connection closed".format(
+                self._request_count, sz))
+            logger.error("HTTP Response #{}: Total bytes received before error: {}".format(
+                self._request_count, self._total_bytes_received))
+            logger.error("HTTP Response #{}: NETWORK ISSUE: Server closed connection during response".format(
+                self._request_count))
+            logger.error("HTTP Response #{}: Possible causes:".format(self._request_count))
+            logger.error("  - Server timeout (query took too long)")
+            logger.error("  - Network proxy/firewall closed connection")
+            logger.error("  - Server crashed or restarted")
+            logger.error("  - Load balancer timeout")
+            logger.error("  - TCP connection reset")
+            logger.error("-" * 80)
+            raise
+        except Exception as e:
+            logger.error("-" * 80)
+            logger.error("HTTP Response #{}: ✗ Error while reading: {} ({})".format(
+                self._request_count, str(e), type(e).__name__))
+            logger.error("-" * 80)
+            raise
+
+
 def _build_odbc_connnection_string(**kwargs: Any) -> str:
     return ";".join([f"{k}={v}" for k, v in kwargs.items()])
 
@@ -281,10 +408,26 @@ class PyhiveConnectionWrapper(SparkConnectionWrapper):
             # Handle bad response in the pyhive lib when
             # the connection is cancelled
             try:
+                logger.debug("Attempting to close cursor")
                 self._cursor.close()
+                logger.debug("Cursor closed successfully")
+            except EOFError as exc:
+                logger.error("EOFError while closing cursor: {}".format(exc))
+                logger.error("This typically indicates the connection was already closed by the server")
+                # Don't re-raise, as we're already closing
             except EnvironmentError as exc:
                 logger.debug("Exception while closing cursor: {}".format(exc))
-        self.handle.close()
+        try:
+            logger.debug("Attempting to close connection handle")
+            self.handle.close()
+            logger.debug("Connection handle closed successfully")
+        except EOFError as exc:
+            logger.error("EOFError while closing connection handle: {}".format(exc))
+            logger.error("Connection was already closed by the server")
+            # Don't re-raise during cleanup
+        except Exception as exc:
+            logger.error("Unexpected error while closing connection handle: {}".format(exc))
+            # Don't re-raise during cleanup
 
     def rollback(self, *args: Any, **kwargs: Any) -> None:
         logger.debug("NotImplemented: rollback")
@@ -317,35 +460,143 @@ class PyhiveConnectionWrapper(SparkConnectionWrapper):
 
         assert self._cursor, "Cursor not available"
 
-        self._cursor.execute(sql, bindings, async_=True)
-        poll_state = self._cursor.poll()
-        state = poll_state.operationState
-
-        while state in STATE_PENDING:
-            logger.debug("Poll status: {}, sleeping".format(state))
-
+        try:
+            logger.info("=" * 80)
+            logger.info("QUERY EXECUTION STARTING")
+            logger.info("SQL length: {} characters".format(len(sql)))
+            logger.info("=" * 80)
+            
+            logger.info("Step 1: Submitting async query to server...")
+            self._cursor.execute(sql, bindings, async_=True)
+            logger.info("Step 1: ✓ Query submitted successfully")
+            
+            logger.info("Step 2: Initial poll to get query status...")
             poll_state = self._cursor.poll()
             state = poll_state.operationState
+            logger.info("Step 2: ✓ Initial poll complete, state={}".format(state))
+            
+            poll_count = 0
+            start_time = time.time()
 
-        # If an errorMessage is present, then raise a database exception
-        # with that exact message. If no errorMessage is present, the
-        # query did not necessarily succeed: check the state against the
-        # known successful states, raising an error if the query did not
-        # complete in a known good state. This can happen when queries are
-        # cancelled, for instance. The errorMessage will be None, but the
-        # state of the query will be "cancelled". By raising an exception
-        # here, we prevent dbt from showing a status of OK when the query
-        # has in fact failed.
-        if poll_state.errorMessage:
-            logger.debug("Poll response: {}".format(poll_state))
-            logger.debug("Poll status: {}".format(state))
-            raise DbtDatabaseError(poll_state.errorMessage)
+            while state in STATE_PENDING:
+                poll_count += 1
+                elapsed = time.time() - start_time
+                logger.info("-" * 80)
+                logger.info("POLL #{} (elapsed: {:.2f}s)".format(poll_count, elapsed))
+                logger.info("Current state: {}".format(state))
+                logger.info("-" * 80)
 
-        elif state not in STATE_SUCCESS:
-            status_type = ThriftState._VALUES_TO_NAMES.get(state, "Unknown<{!r}>".format(state))
-            raise DbtDatabaseError("Query failed with status: {}".format(status_type))
+                try:
+                    logger.info("Poll #{}: Calling GetOperationStatus via Thrift...".format(poll_count))
+                    
+                    # Log connection state before poll
+                    if hasattr(self._cursor, '_connection') and hasattr(self._cursor._connection, 'client'):
+                        client = self._cursor._connection.client
+                        if hasattr(client, '_transport'):
+                            transport = client._transport
+                            logger.debug("Poll #{}: Transport type: {}".format(poll_count, type(transport).__name__))
+                            if hasattr(transport, 'isOpen'):
+                                logger.debug("Poll #{}: Transport open: {}".format(poll_count, transport.isOpen()))
+                    
+                    poll_state = self._cursor.poll()
+                    state = poll_state.operationState
+                    logger.info("Poll #{}: ✓ Received response, new state={}".format(poll_count, state))
+                    
+                except EOFError as e:
+                    logger.error("=" * 80)
+                    logger.error("NETWORK ERROR: EOFError during poll #{}".format(poll_count))
+                    logger.error("=" * 80)
+                    logger.error("Poll #{}: Connection closed unexpectedly during GetOperationStatus".format(poll_count))
+                    logger.error("Poll #{}: Last known query state: {}".format(poll_count, state))
+                    logger.error("Poll #{}: Time elapsed: {:.2f} seconds".format(poll_count, elapsed))
+                    logger.error("Poll #{}: Total polls completed: {}".format(poll_count, poll_count - 1))
+                    
+                    # Detailed transport diagnostics
+                    if hasattr(self._cursor, '_connection') and hasattr(self._cursor._connection, 'client'):
+                        client = self._cursor._connection.client
+                        if hasattr(client, '_transport'):
+                            transport = client._transport
+                            logger.error("Poll #{}: Transport type: {}".format(poll_count, type(transport).__name__))
+                            if hasattr(transport, 'isOpen'):
+                                try:
+                                    is_open = transport.isOpen()
+                                    logger.error("Poll #{}: Transport is open: {}".format(poll_count, is_open))
+                                except:
+                                    logger.error("Poll #{}: Cannot determine transport state".format(poll_count))
+                            
+                            # Check for wrapped transport
+                            if hasattr(transport, '_transport'):
+                                inner_transport = transport._transport
+                                logger.error("Poll #{}: Inner transport type: {}".format(poll_count, type(inner_transport).__name__))
+                    
+                    logger.error("-" * 80)
+                    logger.error("DIAGNOSIS: Network connection lost during query polling")
+                    logger.error("This indicates:")
+                    logger.error("  1. Server/proxy timeout (query running too long)")
+                    logger.error("  2. Network interruption between client and server")
+                    logger.error("  3. Load balancer connection timeout")
+                    logger.error("  4. Server resource exhaustion")
+                    logger.error("=" * 80)
+                    
+                    raise DbtDatabaseError(
+                        "Network connection lost during query execution at poll #{} after {:.2f}s. "
+                        "The server closed the connection while polling for query status. "
+                        "Last state: {}".format(poll_count, elapsed, state)
+                    ) from e
+                    
+                except Exception as e:
+                    logger.error("=" * 80)
+                    logger.error("UNEXPECTED ERROR during poll #{}".format(poll_count))
+                    logger.error("Error type: {}".format(type(e).__name__))
+                    logger.error("Error message: {}".format(str(e)))
+                    logger.error("=" * 80)
+                    raise
 
-        logger.debug("Poll status: {}, query complete".format(state))
+            total_elapsed = time.time() - start_time
+            logger.info("=" * 80)
+            logger.info("QUERY EXECUTION COMPLETE")
+            logger.info("Total polls: {}".format(poll_count))
+            logger.info("Total time: {:.2f} seconds".format(total_elapsed))
+            logger.info("Final state: {}".format(state))
+            logger.info("=" * 80)
+
+            # If an errorMessage is present, then raise a database exception
+            # with that exact message. If no errorMessage is present, the
+            # query did not necessarily succeed: check the state against the
+            # known successful states, raising an error if the query did not
+            # complete in a known good state. This can happen when queries are
+            # cancelled, for instance. The errorMessage will be None, but the
+            # state of the query will be "cancelled". By raising an exception
+            # here, we prevent dbt from showing a status of OK when the query
+            # has in fact failed.
+            if poll_state.errorMessage:
+                logger.debug("Poll response: {}".format(poll_state))
+                logger.debug("Poll status: {}".format(state))
+                raise DbtDatabaseError(poll_state.errorMessage)
+
+            elif state not in STATE_SUCCESS:
+                status_type = ThriftState._VALUES_TO_NAMES.get(state, "Unknown<{!r}>".format(state))
+                raise DbtDatabaseError("Query failed with status: {}".format(status_type))
+
+            logger.debug("Poll status: {}, query complete".format(state))
+            
+        except EOFError as e:
+            logger.error("EOFError during query execution: {}".format(str(e)))
+            logger.error("This error typically occurs when:")
+            logger.error("  1. The authentication token has expired")
+            logger.error("  2. The server closed the connection unexpectedly")
+            logger.error("  3. The HTTP response was truncated or incomplete")
+            logger.error("  4. Network connectivity issues")
+            # Try to get connection details
+            if hasattr(self, 'handle') and hasattr(self.handle, '_connection'):
+                conn = self.handle._connection
+                if hasattr(conn, 'client') and hasattr(conn.client, '_transport'):
+                    transport = conn.client._transport
+                    logger.error("Transport details: type={}, isOpen={}".format(
+                        type(transport).__name__,
+                        transport.isOpen() if hasattr(transport, 'isOpen') else 'unknown'
+                    ))
+            raise DbtDatabaseError("Connection terminated unexpectedly (EOFError). Please check your authentication token and network connectivity.") from e
 
     @classmethod
     def _fix_binding(cls, value: Any) -> Union[float, str]:
@@ -520,6 +771,8 @@ class SparkConnectionManager(SQLConnectionManager):
                         )
  
                     logger.debug("connection url: {}".format(conn_url))
+                    logger.debug("Establishing HTTP transport connection")
+                    logger.debug("SSL verification enabled: {}".format(creds.use_ssl))
 
                     transport = THttpClient.THttpClient(conn_url)
 
@@ -528,12 +781,16 @@ class SparkConnectionManager(SQLConnectionManager):
                         ctx.check_hostname = False
                         ctx.verify_mode = ssl.CERT_NONE
                         transport = THttpClient.THttpClient(conn_url, ssl_context=ctx)
+                        logger.debug("SSL context configured with verification disabled")
 
                     raw_token = "token:{}".format(creds.token).encode()
                     token = base64.standard_b64encode(raw_token).decode()
-                    transport.setCustomHeaders({"Authorization": "Basic {}".format(token)})
+                    auth_header = {"Authorization": "Basic {}".format(token)}
+                    transport.setCustomHeaders(auth_header)
+                    logger.debug("Authorization header set (token length: {} chars)".format(len(creds.token) if creds.token else 0))
 
                     if creds.auth:
+                        logger.debug("Applying additional authentication: {}".format(creds.auth))
                         authenticator = get_authenticator(
                             creds.auth,
                             host,
@@ -541,13 +798,22 @@ class SparkConnectionManager(SQLConnectionManager):
                             creds.suppress_ssl_warnings
                         )
                         transport = authenticator.Authenticate(transport)
+                        logger.debug("Additional authentication applied successfully")
 
+                    # Wrap transport with logging wrapper to capture HTTP traffic
+                    logger.debug("Wrapping transport with HTTP logging")
+                    transport = LoggingTHttpClient(transport)
+
+                    logger.debug("Connecting to Hive with catalog: {}".format(connection_catalog))
+                    logger.debug("Server-side parameters: {}".format(creds.server_side_parameters))
+                    
                     conn = hive.connect(
                         thrift_transport=transport,
                         configuration=creds.server_side_parameters,
                         database=connection_catalog,
 
                     )
+                    logger.debug("Hive connection established successfully")
                     
                     handle = PyhiveConnectionWrapper(conn)
                 elif creds.method == SparkConnectionMethod.THRIFT:
