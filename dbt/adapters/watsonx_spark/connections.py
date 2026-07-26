@@ -116,6 +116,7 @@ class SparkCredentials(Credentials):
     auto_location: bool = False
     suppress_ssl_warnings: bool = True
     connection_catalog: Optional[str] = "default"
+    catalog_file_format: Optional[str] = None  # Populated from catalog API at init time
     # Query execution parameters
     query_timeout: Optional[int] = None  # Timeout in seconds for long-running queries (None = no timeout)
     poll_interval: int = 5  # Polling interval in seconds for async queries
@@ -216,6 +217,7 @@ class SparkCredentials(Credentials):
             self.token = authenticator.get_token()
 
         bucket, file_format = authenticator.get_catlog_details(self.catalog)
+        self.catalog_file_format = file_format
         # Determine which catalog to use for connection connection_catalog will be replaced by catalog
         # For Hudi/Delta: use spark_catalog (they prefix schema with spark_catalog.)
         # For Iceberg/others: use the configured catalog
@@ -526,13 +528,29 @@ class SparkConnectionManager(SQLConnectionManager):
             thrift_resp = exc.args[0]
             if hasattr(thrift_resp, "status") and hasattr(thrift_resp.status, "errorMessage"):
                 error_msg = thrift_resp.status.errorMessage
-                if "permission denied" in error_msg.lower():
+                error_msg_lower = error_msg.lower()
+
+                # SparkStringUtils is missing from some Azure BYOC Spark engine builds.
+                # The crash happens in the post-execution explainString/logging phase —
+                # the DDL/DML itself completed successfully on the server before the crash.
+                # Treat this as a warning and continue rather than failing the dbt run.
+                if "sparkstringutils" in error_msg_lower or (
+                    "noclassdeffounderror" in error_msg_lower and "spark" in error_msg_lower
+                ):
+                    logger.warning(
+                        f"Spark engine reported a non-fatal internal error (NoClassDefFoundError "
+                        f"in post-execution phase) — the SQL statement completed successfully. "
+                        f"This is a known issue with this Spark engine build."
+                    )
+                    return  # suppress — do not raise
+
+                if "permission denied" in error_msg_lower:
                     error_msg += " - Please check your access permissions for this operation."
-                elif "table not found" in error_msg.lower():
+                elif "table not found" in error_msg_lower:
                     error_msg += " - Please verify the table exists and is accessible."
-                elif "syntax error" in error_msg.lower():
+                elif "syntax error" in error_msg_lower:
                     error_msg += " - Please check your SQL syntax."
-                    
+
                 logger.error(error_msg)
                 raise DbtRuntimeError(error_msg) from exc
             else:

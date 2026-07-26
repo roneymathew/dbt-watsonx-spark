@@ -485,7 +485,13 @@ class WatsonxSparkAdapter(SQLAdapter):
         if re.match(regex, string):
             return True
         return False
-    
+
+    @available
+    def get_catalog_file_format(self) -> str:
+        """Return the file format (e.g. 'iceberg', 'delta', 'hudi') of the configured catalog."""
+        creds: SparkCredentials = self.connections.get_thread_connection().credentials
+        return creds.catalog_file_format or ""
+
     @available.parse_none
     def set_configuration(self, config: SparkConfig) -> None:
         profile_cred: SparkCredentials = self.connections.get_thread_connection().credentials
