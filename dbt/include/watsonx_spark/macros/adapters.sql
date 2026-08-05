@@ -146,7 +146,7 @@
 
 {#-- We can't use temporary tables with `create ... as ()` syntax --#}
 {% macro watsonx_spark__create_temporary_view(relation, compiled_code) -%}
-{{ log("[DEBUG] Creating temp view: " ~ relation.render(), info=True) }}
+{{ log("[DEBUG] Creating temp view: " ~ relation.render(), info=False) }}
     create or replace temporary view {{ relation.render() }} as
     {{ compiled_code }}
 {%- endmacro -%}
@@ -267,7 +267,7 @@
 {% endmacro %}
 
 {% macro watsonx_spark__create_view_as(relation, sql) -%}
- {{ log("[DEBUG] Creating view: " ~ relation.render(), info=True) }}
+ {{ log("[DEBUG] Creating view: " ~ relation.render(), info=False) }}
   create or replace view {{ relation.render() }}
   {% if config.persist_column_docs() -%}
     {% set model_columns = model.columns %}
@@ -317,70 +317,60 @@
   {#
     For Iceberg catalogs, we must drop all tables before dropping the schema.
     Iceberg doesn't support CASCADE properly and will fail if tables exist.
-    
-    We detect Iceberg by checking if a catalog is configured (watsonx.data uses Iceberg).
+
+    Use adapter.get_catalog_file_format() rather than dot-in-schema heuristics so
+    that Hudi/Delta schemas (which also use "spark_catalog.schema") are not incorrectly
+    treated as Iceberg.
   #}
-  
-  {{ log("[DROP_SCHEMA] Starting drop_schema for relation: " ~ relation, info=True) }}
-  {{ log("[DROP_SCHEMA] relation.database: " ~ relation.database, info=True) }}
-  {{ log("[DROP_SCHEMA] relation.schema: " ~ relation.schema, info=True) }}
-  
+  {%- set file_format = adapter.get_catalog_file_format() -%}
+  {%- set is_iceberg = file_format == 'iceberg' -%}
+
+  {{ log("[DROP_SCHEMA] Starting drop_schema for relation: " ~ relation, info=False) }}
+  {{ log("[DROP_SCHEMA] relation.database: " ~ relation.database, info=False) }}
+  {{ log("[DROP_SCHEMA] relation.schema: " ~ relation.schema, info=False) }}
+
   {# Build the full schema name with catalog #}
-  {# Check if relation has database (catalog) set, or if schema already contains catalog.schema format #}
   {%- if relation.database -%}
     {%- set full_schema_name = relation.database ~ '.' ~ relation.schema -%}
-    {%- set has_catalog = true -%}
-    {{ log("[DROP_SCHEMA] Detected catalog from relation.database: " ~ full_schema_name, info=True) }}
-  {%- elif '.' in relation.schema -%}
-    {# Schema already has catalog.schema format (e.g., "iceberg_data.test_schema") #}
-    {%- set full_schema_name = relation.schema -%}
-    {%- set has_catalog = true -%}
-    {{ log("[DROP_SCHEMA] Detected catalog from schema name (contains dot): " ~ full_schema_name, info=True) }}
   {%- else -%}
     {%- set full_schema_name = relation.schema -%}
-    {%- set has_catalog = false -%}
-    {{ log("[DROP_SCHEMA] No catalog detected, using schema only: " ~ full_schema_name, info=True) }}
   {%- endif -%}
-  
-  {{ log("[DROP_SCHEMA] has_catalog: " ~ has_catalog ~ ", full_schema_name: " ~ full_schema_name, info=True) }}
-  
-  {# If we have a catalog (Iceberg), drop tables first #}
-  {% if has_catalog %}
-    {{ log("[DROP_SCHEMA] Iceberg catalog detected - will drop tables first", info=True) }}
-    
-    {# Create a relation object with the full catalog.schema in the schema field #}
-    {# This is required because list_relations_without_caching expects schema to contain catalog.schema for Iceberg #}
+
+  {{ log("[DROP_SCHEMA] is_iceberg: " ~ is_iceberg ~ ", full_schema_name: " ~ full_schema_name, info=False) }}
+
+  {# For Iceberg: drop all tables first because CASCADE is not supported #}
+  {% if is_iceberg %}
+    {{ log("[DROP_SCHEMA] Iceberg catalog detected - will drop tables first", info=False) }}
+
     {%- set schema_relation = adapter.Relation.create(database=none, schema=full_schema_name) -%}
-    {{ log("[DROP_SCHEMA] Created schema_relation for listing: " ~ schema_relation, info=True) }}
-    
-    {# Use the adapter method to get relation objects (now exposed via @available decorator) #}
+    {{ log("[DROP_SCHEMA] Created schema_relation for listing: " ~ schema_relation, info=False) }}
+
     {%- set tables_in_schema = adapter.list_relations_without_caching(schema_relation) -%}
-    {{ log("[DROP_SCHEMA] Found " ~ tables_in_schema|length ~ " relations to drop", info=True) }}
-    
-    {# Drop all tables and views first for Iceberg compatibility #}
+    {{ log("[DROP_SCHEMA] Found " ~ tables_in_schema|length ~ " relations to drop", info=False) }}
+
     {% for table in tables_in_schema %}
-      {{ log("[DROP_SCHEMA] Dropping " ~ table.type ~ ": " ~ table, info=True) }}
+      {{ log("[DROP_SCHEMA] Dropping " ~ table.type ~ ": " ~ table, info=False) }}
       {%- call statement('drop_relation_' ~ loop.index, auto_begin=False) -%}
         drop {{ table.type }} if exists {{ table }}
       {%- endcall -%}
     {% endfor %}
-    
-    {{ log("[DROP_SCHEMA] Finished dropping all relations", info=True) }}
+
+    {{ log("[DROP_SCHEMA] Finished dropping all relations", info=False) }}
   {% else %}
-    {{ log("[DROP_SCHEMA] No catalog - skipping table cleanup, will use CASCADE", info=True) }}
+    {{ log("[DROP_SCHEMA] Non-Iceberg format (" ~ file_format ~ ") - will use CASCADE", info=False) }}
   {% endif %}
-  
-  {# Now drop the schema - don't use CASCADE for Iceberg since we already dropped all tables #}
-  {{ log("[DROP_SCHEMA] Now dropping schema: " ~ full_schema_name ~ " (CASCADE: " ~ (not has_catalog) ~ ")", info=True) }}
+
+  {# Drop the schema; use CASCADE for non-Iceberg formats #}
+  {{ log("[DROP_SCHEMA] Now dropping schema: " ~ full_schema_name ~ " (CASCADE: " ~ (not is_iceberg) ~ ")", info=False) }}
   {%- call statement('drop_schema') -%}
-    {% if has_catalog %}
+    {% if is_iceberg %}
       drop schema if exists {{ full_schema_name }}
     {% else %}
       drop schema if exists {{ full_schema_name }} cascade
     {% endif %}
   {%- endcall -%}
-  
-  {{ log("[DROP_SCHEMA] Completed drop_schema", info=True) }}
+
+  {{ log("[DROP_SCHEMA] Completed drop_schema", info=False) }}
 {% endmacro %}
 
 {% macro get_columns_in_relation_raw(relation) -%}
@@ -433,9 +423,9 @@
   {#-- V2 iceberg tables #}
   {#-- https://issues.apache.org/jira/browse/SPARK-33393 #}
   {%- set sql_query = "show tables in " ~ schema_relation.schema ~ " like '*'" -%}
-  {{ log("[MACRO] list_relations_show_tables_without_caching SQL: " ~ sql_query, info=True) }}
-  {{ log("[MACRO] schema_relation.schema = " ~ schema_relation.schema, info=True) }}
-  {{ log("[MACRO] schema_relation object = " ~ schema_relation, info=True) }}
+  {{ log("[MACRO] list_relations_show_tables_without_caching SQL: " ~ sql_query, info=False) }}
+  {{ log("[MACRO] schema_relation.schema = " ~ schema_relation.schema, info=False) }}
+  {{ log("[MACRO] schema_relation object = " ~ schema_relation, info=False) }}
   {% call statement('list_relations_without_caching_show_tables', fetch_result=True) -%}
     show tables in {{ schema_relation.schema }} like '*'
   {% endcall %}
@@ -494,7 +484,7 @@
 
 {% macro watsonx_spark__drop_relation(relation) -%}
   {% call statement('drop_relation', auto_begin=False) -%}
-    {{ log("[DEBUG] Dropping " ~ relation.type ~ ": " ~ relation.render(), info=True) }}
+    {{ log("[DEBUG] Dropping " ~ relation.type ~ ": " ~ relation.render(), info=False) }}
     drop {{ relation.type }} if exists {{ relation.render() }}
   {%- endcall %}
 {% endmacro %}
@@ -544,10 +534,10 @@
        - If no: It's a 2-part name (Hive/Hudi/Delta on spark_catalog), use 1-part identifier.
     #}
     {%- if base_relation.database -%}
-        {{ log("[DEBUG] 3-Part Name Detected. Catalog: " ~ base_relation.database ~ ". Forcing full inclusion.", info=True) }}
+        {{ log("[DEBUG] 3-Part Name Detected. Catalog: " ~ base_relation.database ~ ". Forcing full inclusion.", info=False) }}
         {%- set tmp_relation = tmp_relation.include(database=True, schema=True) -%}
     {%- else -%}
-        {{ log("[DEBUG] 2-Part Name Detected. Using 1-part identifier for temp relation.", info=True) }}
+        {{ log("[DEBUG] 2-Part Name Detected. Using 1-part identifier for temp relation.", info=False) }}
         {%- set tmp_relation = tmp_relation.include(database=False, schema=False) -%}
     {%- endif -%}
     

@@ -225,11 +225,11 @@ class SparkCredentials(Credentials):
         if file_format == "iceberg":
             self.schema = self.catalog + "." + self.schema
             self.connection_catalog = self.catalog
-        if file_format == "delta" or file_format == "hudi":
+        elif file_format in ("delta", "hudi"):
             self.schema = "spark_catalog." + self.schema
             self.connection_catalog = "spark_catalog"
         else:
-             self.connection_catalog = self.catalog
+            self.connection_catalog = self.catalog
 
     @property
     def type(self) -> str:
