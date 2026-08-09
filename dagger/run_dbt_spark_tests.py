@@ -150,10 +150,9 @@ async def test_spark(test_args):
 
         tst_container = tst_container.with_(env_variables(TESTING_ENV_VARS))
         test_path = test_args.test_path if test_args.test_path else "tests/functional/adapter"
-        pytest_cmd = ["pytest", "-v", "--profile", test_profile, "-n", "auto", test_path]
-        if test_args.markers:
-            pytest_cmd += ["-m", test_args.markers]
-        result = await tst_container.with_exec(pytest_cmd).stdout()
+        result = await tst_container.with_exec(
+            ["pytest", "-v", "--profile", test_profile, "-n", "auto", test_path]
+        ).stdout()
 
         return result
 
@@ -161,7 +160,6 @@ async def test_spark(test_args):
 parser = argparse.ArgumentParser()
 parser.add_argument("--profile", required=True, type=str)
 parser.add_argument("--test-path", required=False, type=str)
-parser.add_argument("--markers", required=False, type=str, help="pytest -m expression, e.g. 'performance'")
 args = parser.parse_args()
 
 anyio.run(test_spark, args)
