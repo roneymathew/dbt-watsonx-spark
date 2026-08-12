@@ -113,8 +113,9 @@
     {% endif %}
   {% endif %}
 
-  {% if not adapter.check_schema_exists(model.database, model.schema) %}
-    {% do create_schema(model.schema , config) %}
+  {% if not adapter.check_schema_exists(target_relation.database, target_relation.schema) %}
+    {%- set schema_relation = api.Relation.create(database=target_relation.database, schema=target_relation.schema) -%}
+    {% do create_schema(schema_relation) %}
   {% endif %}
 
   {%- if not target_relation.is_table -%}
@@ -131,7 +132,7 @@
   {% if not target_relation_exists %}
 
       {% set build_sql = build_snapshot_table(strategy, model['compiled_code']) %}
-      {% set final_sql = create_table_as(False, target_relation, build_sql , config) %}
+      {% set final_sql = create_table_as(False, target_relation, build_sql, config) %}
 
   {% else %}
 

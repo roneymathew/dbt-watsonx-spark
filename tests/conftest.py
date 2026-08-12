@@ -1,11 +1,62 @@
 import pytest
 import os
+from datetime import datetime
 
 pytest_plugins = ["dbt.tests.fixtures.project"]
+
+# Module-level variables for log directory management
+_test_run_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+_test_class_counter = {}
 
 
 def pytest_addoption(parser):
     parser.addoption("--profile", action="store", default="apache_spark", type=str)
+
+
+@pytest.fixture(scope="class")
+def logs_dir(request):
+    """
+    Override dbt's logs_dir fixture to create organized log directories.
+    
+    Creates a unique directory for each test class in format:
+    logs/<timestamp>/<TestClassName>_<counter>/
+    
+    This ensures:
+    1. Each test run gets a timestamped parent directory
+    2. Each test class gets its own subdirectory
+    3. Multiple runs of the same test class get unique directories via counter
+    
+    IMPORTANT: Sets DBT_LOG_PATH environment variable so dbt writes logs to our custom directory.
+    """
+    # Get the test class name
+    test_class_name = request.cls.__name__ if request.cls else "unknown"
+    
+    # Increment counter for this test class
+    if test_class_name not in _test_class_counter:
+        _test_class_counter[test_class_name] = 0
+    _test_class_counter[test_class_name] += 1
+    
+    # Create directory name with counter
+    dir_name = f"{test_class_name}_{_test_class_counter[test_class_name]}"
+    
+    # Get absolute path to workspace root
+    workspace_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    
+    # Create full path: workspace/logs/<timestamp>/<TestClass>_<counter>
+    log_dir = os.path.join(workspace_root, "logs", _test_run_timestamp, dir_name)
+    
+    # Create the directory
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # Set environment variable so dbt uses our custom log directory
+    os.environ["DBT_LOG_PATH"] = str(log_dir)
+    
+    # Yield the path (required by dbt's test framework)
+    yield str(log_dir)
+    
+    # Cleanup: remove environment variable after test
+    if "DBT_LOG_PATH" in os.environ:
+        del os.environ["DBT_LOG_PATH"]
 
 
 # Using @pytest.mark.skip_profile('apache_spark') uses the 'skip_by_profile_type'

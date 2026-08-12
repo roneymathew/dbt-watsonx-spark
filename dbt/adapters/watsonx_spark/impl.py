@@ -60,6 +60,7 @@ LIST_RELATIONS_SHOW_TABLES_MACRO_NAME = "list_relations_show_tables_without_cach
 DESCRIBE_TABLE_EXTENDED_MACRO_NAME = "describe_table_extended_without_caching"
 DESCRIBE_TABLE_MACRO_NAME = "describe_table_without_caching"
 CREATE_SCHEMA_MACRO_NAME = "create_schema"
+DROP_SCHEMA_MACRO_NAME = "drop_schema"
 CREATE_TABLE_MACRO_NAME = "create_table_as"
 
 KEY_TABLE_OWNER = "Owner"
@@ -290,6 +291,7 @@ class WatsonxSparkAdapter(SQLAdapter):
 
         return relations
 
+    @available
     def list_relations_without_caching(self, schema_relation: BaseRelation) -> List[BaseRelation]:
         """Distinct Spark compute engines may not support the same SQL featureset. Thus, we must
         try different methods to fetch relation information.
@@ -573,6 +575,165 @@ class WatsonxSparkAdapter(SQLAdapter):
         }
         self.execute_macro(CREATE_SCHEMA_MACRO_NAME, kwargs=kwargs)
         self.commit_if_has_connection()
+    
+    def _list_views_in_schema(self, schema_relation: BaseRelation) -> List[BaseRelation]:
+        """
+        List views in a schema using SHOW VIEWS.
+        
+        This is needed for Iceberg catalogs where SHOW TABLES doesn't return views.
+        Views are stored in the Hive metastore but not visible to Iceberg's SHOW TABLES.
+        
+        Args:
+            schema_relation: Relation with schema set to full catalog.schema path
+            
+        Returns:
+            List of view relations
+        """
+        views = []
+        try:
+            full_schema_name = schema_relation.schema
+            show_views_sql = f"show views in {full_schema_name}"
+            logger.debug(f"Executing: {show_views_sql}")
+            
+            _, view_table = self.connections.execute(show_views_sql, auto_begin=False, fetch=True)
+            
+            if view_table:
+                for row in view_table:
+                    # SHOW VIEWS returns: namespace, viewName, isTemporary
+                    view_name = row[1] if len(row) > 1 else row[0]
+                    view_relation = self.Relation.create(
+                        schema=full_schema_name,
+                        identifier=view_name,
+                        type=self.Relation.View
+                    )
+                    views.append(view_relation)
+                    logger.debug(f"Found view: {view_name}")
+        except Exception as e:
+            # SHOW VIEWS may not be supported in all environments
+            logger.debug(f"Could not list views (may not be supported): {e}")
+        
+        return views
+        
+    def drop_schema(self, relation: BaseRelation) -> None:
+        """
+        Override to handle Iceberg catalogs properly.
+        
+        For Iceberg catalogs, we must drop all tables before dropping the schema
+        because Iceberg doesn't support CASCADE properly.
+        """
+        relation = relation.without_identifier()
+        logger.info(f"[DROP_SCHEMA] Dropping schema for relation: {relation}")
+        
+        # Get credentials to check if we have a catalog configured
+        creds = self._get_active_credentials()
+        has_catalog = bool(creds.catalog)
+        
+        # Build the full schema name
+        if creds.catalog and not relation.database:
+            # Add catalog prefix if not already present
+            if '.' not in relation.schema:
+                full_schema_name = f"{creds.catalog}.{relation.schema}"
+                logger.info(f"[DROP_SCHEMA] Added catalog prefix: {full_schema_name}")
+            else:
+                full_schema_name = relation.schema
+        elif relation.database:
+            full_schema_name = f"{relation.database}.{relation.schema}"
+        else:
+            full_schema_name = relation.schema
+            has_catalog = False
+        
+        # For Iceberg catalogs, drop all tables first
+        if has_catalog:
+            logger.info(f"[DROP_SCHEMA] Iceberg catalog detected - dropping tables first")
+            
+            try:
+                # Create a relation object for listing tables
+                # SparkRelation uses schema field to hold the full catalog.schema path
+                schema_relation = self.Relation.create(
+                    schema=full_schema_name,
+                    identifier=None
+                )
+                
+                logger.info(f"[DROP_SCHEMA] Listing relations in schema: {schema_relation}")
+                logger.debug(f"[DROP_SCHEMA] schema_relation details: database={schema_relation.database}, schema={schema_relation.schema}, identifier={schema_relation.identifier}")
+                
+                tables = self.list_relations_without_caching(schema_relation)
+                logger.info(f"[DROP_SCHEMA] Found {len(tables)} tables from SHOW TABLES")
+                
+                # Also get views - SHOW TABLES doesn't return views in Iceberg
+                views = []
+                try:
+                    show_views_sql = f"show views in {full_schema_name}"
+                    logger.info(f"[DROP_SCHEMA] Executing: {show_views_sql}")
+                    _, view_table = self.connections.execute(show_views_sql, auto_begin=False, fetch=True)
+                    
+                    if view_table:
+                        for row in view_table:
+                            # SHOW VIEWS returns: namespace, viewName, isTemporary
+                            view_name = row[1] if len(row) > 1 else row[0]
+                            view_relation = self.Relation.create(
+                                schema=full_schema_name,
+                                identifier=view_name,
+                                type=self.Relation.View
+                            )
+                            views.append(view_relation)
+                            logger.info(f"[DROP_SCHEMA] Found view: {view_name}")
+                    
+                    logger.info(f"[DROP_SCHEMA] Found {len(views)} views from SHOW VIEWS")
+                except Exception as e:
+                    logger.warning(f"[DROP_SCHEMA] Could not list views (may not be supported): {e}")
+                
+                # Combine tables and views
+                all_relations = tables + views
+                logger.info(f"[DROP_SCHEMA] Total relations to drop: {len(all_relations)} ({len(tables)} tables + {len(views)} views)")
+                
+                # Drop each table/view with detailed logging
+                for i, table in enumerate(all_relations, 1):
+                    logger.info(f"[DROP_SCHEMA] Relation {i}/{len(tables)}: type={table.type}, database={table.database}, schema={table.schema}, identifier={table.identifier}")
+                    logger.info(f"[DROP_SCHEMA] Full relation string: {table}")
+                    
+                    # For Iceberg, list_relations may incorrectly identify views as tables
+                    # Try dropping as the reported type first, then try the other type if it fails
+                    dropped = False
+                    for drop_type in [table.type, 'view' if table.type == 'table' else 'table']:
+                        drop_sql = f"drop {drop_type} if exists {table}"
+                        logger.debug(f"[DROP_SCHEMA] Attempting: {drop_sql}")
+                        try:
+                            self.connections.execute(drop_sql, auto_begin=False, fetch=False)
+                            logger.info(f"[DROP_SCHEMA] Successfully dropped {drop_type}: {table.identifier}")
+                            dropped = True
+                            break
+                        except Exception as e:
+                            logger.debug(f"[DROP_SCHEMA] Failed to drop as {drop_type}: {e}")
+                            if drop_type == table.type:
+                                # Try the other type
+                                continue
+                            else:
+                                # Both attempts failed
+                                logger.warning(f"[DROP_SCHEMA] Could not drop {table.identifier} as table or view: {e}")
+                    
+                    if not dropped:
+                        logger.warning(f"[DROP_SCHEMA] Failed to drop relation: {table.identifier}")
+                
+                logger.info(f"[DROP_SCHEMA] Finished dropping all {len(tables)} relations")
+            except Exception as e:
+                logger.warning(f"[DROP_SCHEMA] Error listing/dropping relations: {e}")
+                logger.warning(f"[DROP_SCHEMA] Will attempt to drop schema anyway")
+                import traceback
+                logger.debug(f"[DROP_SCHEMA] Full traceback: {traceback.format_exc()}")
+        
+        # Now drop the schema (without CASCADE for Iceberg since tables are already dropped)
+        if has_catalog:
+            drop_schema_sql = f"drop schema if exists {full_schema_name}"
+        else:
+            drop_schema_sql = f"drop schema if exists {full_schema_name} cascade"
+        
+        logger.info(f"[DROP_SCHEMA] Executing: {drop_schema_sql}")
+        self.connections.execute(drop_schema_sql, auto_begin=False, fetch=False)
+        self.commit_if_has_connection()
+        logger.info(f"[DROP_SCHEMA] Schema dropped successfully")
+
+
 
     @available.parse_none
     def set_location_root(self, relation: SparkRelation, config: SparkConfig) -> Optional[str]:
@@ -628,7 +789,13 @@ class WatsonxSparkAdapter(SQLAdapter):
         if re.match(regex, string):
             return True
         return False
-    
+
+    @available
+    def get_catalog_file_format(self) -> str:
+        """Return the file format (e.g. 'iceberg', 'delta', 'hudi') of the configured catalog."""
+        creds: SparkCredentials = self.connections.get_thread_connection().credentials
+        return creds.catalog_file_format or ""
+
     @available.parse_none
     def set_configuration(self, config: SparkConfig) -> None:
         profile_cred: SparkCredentials = self.connections.get_thread_connection().credentials
@@ -733,8 +900,24 @@ class WatsonxSparkAdapter(SQLAdapter):
         database = information_schema.database
         schema = list(schemas)[0]
 
+        # Get tables using list_relations
+        relations = self.list_relations(database, schema)
+        
+        # For Iceberg catalogs, also get views since SHOW TABLES doesn't return them
+        creds = self._get_active_credentials()
+        if creds.catalog:
+            # Build full schema name with catalog prefix
+            full_schema = f"{creds.catalog}.{schema}" if '.' not in schema else schema
+            schema_relation = self.Relation.create(schema=full_schema, identifier=None)
+            
+            # Get views using the helper method
+            views = self._list_views_in_schema(schema_relation)
+            if views:
+                logger.debug(f"Adding {len(views)} views to catalog for schema {schema}")
+                relations.extend(views)
+        
         columns: List[Dict[str, Any]] = []
-        for relation in self.list_relations(database, schema):
+        for relation in relations:
             logger.debug("Getting table schema for relation {}", str(relation))
             columns.extend(self._get_columns_for_catalog(relation))
         return agate.Table.from_object(columns, column_types=DEFAULT_TYPE_TESTER)

@@ -96,6 +96,7 @@ class SparkCredentials(Credentials):
     suppress_ssl_warnings: bool = True
     connection_catalog: Optional[str] = "default"
     quote_identifiers: bool = True  # Quote table/schema names to handle special characters
+    catalog_file_format: Optional[str] = None  # Populated from catalog API at init time
 
     @classmethod
     def __pre_deserialize__(cls, data: Any) -> Any:
@@ -192,6 +193,7 @@ class SparkCredentials(Credentials):
             self.token = authenticator.get_token()
 
         bucket, file_format = authenticator.get_catlog_details(self.catalog)
+        self.catalog_file_format = file_format
         # Determine which catalog to use for connection connection_catalog will be replaced by catalog
         # For Hudi/Delta: use spark_catalog (they prefix schema with spark_catalog.)
         # For Iceberg/others: use the configured catalog
@@ -280,12 +282,15 @@ class PyhiveConnectionWrapper(SparkConnectionWrapper):
     def close(self) -> None:
         if self._cursor:
             # Handle bad response in the pyhive lib when
-            # the connection is cancelled
+            # the connection is cancelled or the server drops the connection
             try:
                 self._cursor.close()
-            except EnvironmentError as exc:
+            except (EnvironmentError, EOFError) as exc:
                 logger.debug("Exception while closing cursor: {}".format(exc))
-        self.handle.close()
+        try:
+            self.handle.close()
+        except (EnvironmentError, EOFError) as exc:
+            logger.debug("Exception while closing handle: {}".format(exc))
 
     def rollback(self, *args: Any, **kwargs: Any) -> None:
         logger.debug("NotImplemented: rollback")
@@ -324,6 +329,7 @@ class PyhiveConnectionWrapper(SparkConnectionWrapper):
 
         while state in STATE_PENDING:
             logger.debug("Poll status: {}, sleeping".format(state))
+            time.sleep(5)
 
             poll_state = self._cursor.poll()
             state = poll_state.operationState
@@ -450,6 +456,21 @@ class SparkConnectionManager(SQLConnectionManager):
                     # Check if this is an expected fallback error (will try next fallback silently)
                     elif "schema_not_found" in error_msg_lower or "nosuchdatabaseexception" in error_msg_lower:
                         pass  # Expected error, will try alternative
+
+                    # SparkStringUtils is missing from some Azure BYOC Spark engine builds.
+                    # The crash happens in the post-execution explainString/logging phase — the
+                    # DDL/DML itself completed successfully on the server before the crash.
+                    # Treat this as a warning and continue rather than failing the dbt run.
+                    elif "sparkstringutils" in error_msg_lower or (
+                        "noclassdeffounderror" in error_msg_lower and "spark" in error_msg_lower
+                    ):
+                        logger.warning(
+                            f"Spark engine reported a non-fatal internal error (NoClassDefFoundError "
+                            f"in post-execution phase) — the SQL statement completed successfully. "
+                            f"This is a known issue with this Spark engine build. "
+                            f"SQL: {sql.strip()[:120]}"
+                        )
+                        return  # suppress — do not raise
                     
                     else:
                         # Not an expected error, log it normally

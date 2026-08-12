@@ -205,6 +205,106 @@ class TestStatusCodeHandler(unittest.TestCase):
         self.assertIsInstance(error, InvalidCredentialsError)
         self.assertIn("CPD setup documentation", str(error))
         self.assertIn("https://www.ibm.com/docs/en/watsonxdata", str(error))
+    
+    def test_handle_response_without_logging(self):
+        """Test handle_response with log_errors=False"""
+        mock_error_response = MagicMock()
+        mock_error_response.status_code = 500
+        mock_error_response.text = "Internal Server Error"
+        
+        # Test without logging
+        success, error_msg = StatusCodeHandler.handle_response(
+            mock_error_response,
+            log_errors=False
+        )
+        self.assertFalse(success)
+        self.assertIn("Internal server error", error_msg)
+    
+    def test_all_default_messages(self):
+        """Test all default error messages"""
+        test_cases = {
+            400: "bad request",
+            401: "authentication failed",
+            403: "permission denied",
+            404: "resource not found",
+            429: "too many requests",
+            500: "internal server error",
+            502: "bad gateway",
+            503: "service unavailable",
+            504: "gateway timeout"
+        }
+        
+        for status_code, expected_text in test_cases.items():
+            msg = StatusCodeHandler.get_error_message(status_code).lower()
+            self.assertIn(expected_text, msg)
+
+
+class TestExceptions(unittest.TestCase):
+    """Test exception classes"""
+    
+    def test_token_retrieval_error_basic(self):
+        """Test TokenRetrievalError with no parameters"""
+        error = TokenRetrievalError()
+        self.assertIn("Failed to retrieve authentication token", str(error))
+        self.assertIsNone(error.status_code)
+    
+    def test_token_retrieval_error_with_status(self):
+        """Test TokenRetrievalError with status code"""
+        error = TokenRetrievalError(status_code=401)
+        self.assertIn("Status code: 401", str(error))
+        self.assertEqual(error.status_code, 401)
+    
+    def test_token_retrieval_error_with_message(self):
+        """Test TokenRetrievalError with custom message"""
+        error = TokenRetrievalError(message="Custom error details")
+        self.assertIn("Custom error details", str(error))
+    
+    def test_catalog_details_error_basic(self):
+        """Test CatalogDetailsError with no parameters"""
+        error = CatalogDetailsError()
+        self.assertIn("Failed to retrieve catalog details", str(error))
+    
+    def test_catalog_details_error_with_catalog_name(self):
+        """Test CatalogDetailsError with catalog name"""
+        error = CatalogDetailsError(catalog_name="my_catalog")
+        self.assertIn("my_catalog", str(error))
+    
+    def test_catalog_details_error_with_all_params(self):
+        """Test CatalogDetailsError with all parameters"""
+        error = CatalogDetailsError(
+            catalog_name="test_catalog",
+            status_code=404,
+            message="Not found"
+        )
+        self.assertIn("test_catalog", str(error))
+        self.assertIn("404", str(error))
+        self.assertIn("Not found", str(error))
+        self.assertEqual(error.status_code, 404)
+    
+    def test_connection_error_basic(self):
+        """Test ConnectionError with no parameters"""
+        error = ConnectionError()
+        self.assertIn("Failed to connect to query server", str(error))
+    
+    def test_connection_error_with_host(self):
+        """Test ConnectionError with host"""
+        error = ConnectionError(host="example.com")
+        self.assertIn("example.com", str(error))
+    
+    def test_connection_error_with_message(self):
+        """Test ConnectionError with message"""
+        error = ConnectionError(message="Connection refused")
+        self.assertIn("Connection refused", str(error))
+    
+    def test_authentication_error_basic(self):
+        """Test AuthenticationError with no parameters"""
+        error = AuthenticationError()
+        self.assertIn("Authentication failed", str(error))
+    
+    def test_authentication_error_with_message(self):
+        """Test AuthenticationError with message"""
+        error = AuthenticationError(message="Invalid token")
+        self.assertIn("Invalid token", str(error))
 
 
 if __name__ == '__main__':

@@ -77,7 +77,7 @@ create_query_server() {
     local encoded_apikey=$(echo -n "$CPD_USERNAME:$WATSONX_APIKEY" | base64)
     
     # Base Conf
-    local conf_str='"spark.driver.cores": "1", "spark.driver.memory": "4g", "ae.spark.executor.count": "1", "spark.hadoop.wxd.apikey": "ZenApiKey '$encoded_apikey'"'
+    local conf_str='"spark.driver.cores": "2", "spark.driver.memory": "6g","spark.executor.cores":"2","spark.executor.memory": "6g", "ae.spark.executor.count": "2", "spark.hadoop.wxd.apikey": "ZenApiKey '$encoded_apikey'"'
 
     # Apply Authz Extension if requested
     if [ "$authz_enabled" == "true" ]; then
@@ -171,7 +171,8 @@ main() {
     export WATSONX_INSTANCE="$WATSONX_INSTANCE_ID"
     export WATSONX_USER="$CPD_USERNAME"
     
-    pytest "tests/functional/adapter/catalog_tests/" -v --profile "watsonx_test" --tb=short || log_warning "Standard tests failed"
+    log_info "Running standard functional tests..."
+    pytest "tests/functional/adapter/" -v --profile "watsonx_test" --tb=short
 
     # 3. Authz Query Server & Tests
     log_info "=== Phase 2: Authz Query Server Test ==="
