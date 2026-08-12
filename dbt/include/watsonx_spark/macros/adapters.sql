@@ -18,8 +18,9 @@
 {%- endmacro -%}
 
 {% macro watsonx_spark__file_format_clause() %}
-  {%- set file_format = config.get('file_format', validator=validation.any[basestring]) -%}
-  {%- if file_format is not none %}
+  {%- set file_format = config.get('file_format', validator=validation.any[basestring])
+      or adapter.get_catalog_file_format() -%}
+  {%- if file_format is not none and file_format != '' %}
     using {{ file_format }}
   {%- endif %}
 {%- endmacro -%}
@@ -170,7 +171,7 @@
       {%- if temporary -%}
         {{ create_temporary_view(relation, compiled_code) }}
       {%- else -%}
-        {% if config.get('file_format', validator=validation.any[basestring]) in ['delta', 'iceberg'] %}
+        {% if config.get('file_format', validator=validation.any[basestring]) in ['delta', 'iceberg', 'hive'] %}
           create or replace table {{ relation.render() }}
         {% else %}
           create table {{ relation.render() }}
@@ -299,11 +300,22 @@
       {%- set locationPath = adapter.set_location_root(relation, config) -%}
     {%- endif -%}
 
+    {#--
+      For Hudi/Delta, self.schema was prefixed with "spark_catalog." for Spark SQL
+      routing (e.g. "spark_catalog.second"), but MDS only knows the bare schema name.
+      Strip the prefix so CREATE SCHEMA targets the metastore correctly.
+    --#}
+    {%- if file_format in ('hudi', 'delta') -%}
+      {%- set schema_name = relation.schema.split('.')[-1] -%}
+    {%- else -%}
+      {%- set schema_name = relation.render() -%}
+    {%- endif -%}
+
     {%- call statement('create_schema') -%}
       {%- if locationPath is not none %}
-        create schema if not exists {{relation}} location {{locationPath}}
+        create schema if not exists {{ schema_name }} location {{locationPath}}
       {%- else %}
-        create schema if not exists {{relation}}
+        create schema if not exists {{ schema_name }}
       {%- endif -%}
     {% endcall %}
   {%- endif -%}
@@ -457,12 +469,26 @@
 {% endmacro %}
 
 {% macro watsonx_spark__list_schemas(database) -%}
-  {%- set catalog = database or adapter.config.credentials.catalog -%}
+  {%- set file_format = adapter.get_catalog_file_format() -%}
   {% call statement('list_schemas', fetch_result=True, auto_begin=False) %}
-    {%- if catalog %}
-    show schemas in {{ catalog }}
-    {%- else %}
-    show databases
+    {%- if file_format in ('hudi', 'delta') -%}
+      {#--
+        Hudi/Delta: schemas live under Spark's internal spark_catalog.
+        SHOW SCHEMAS IN spark_catalog lists them correctly.
+      --#}
+      show schemas in spark_catalog
+    {%- elif file_format == 'iceberg' -%}
+      {#--
+        Iceberg: schemas are namespaces under the MDS-registered catalog.
+        SHOW SCHEMAS IN <catalog> lists them.
+      --#}
+      show schemas in {{ adapter.config.credentials.catalog }}
+    {%- else -%}
+      {#--
+        hive-hadoop2 and other legacy formats: schemas are plain Hive databases.
+        SHOW DATABASES lists all of them; no catalog prefix needed or supported.
+      --#}
+      show databases
     {%- endif %}
   {% endcall %}
   {{ return(load_result('list_schemas').table) }}

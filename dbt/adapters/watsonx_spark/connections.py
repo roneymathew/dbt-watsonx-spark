@@ -116,7 +116,6 @@ class SparkCredentials(Credentials):
     auto_location: bool = False
     suppress_ssl_warnings: bool = True
     connection_catalog: Optional[str] = "default"
-    catalog_file_format: Optional[str] = None  # Populated from catalog API at init time
     # Query execution parameters
     query_timeout: Optional[int] = None  # Timeout in seconds for long-running queries (None = no timeout)
     poll_interval: int = 5  # Polling interval in seconds for async queries
@@ -218,18 +217,30 @@ class SparkCredentials(Credentials):
 
         bucket, file_format = authenticator.get_catlog_details(self.catalog)
         self.catalog_file_format = file_format
-        # Determine which catalog to use for connection connection_catalog will be replaced by catalog
-        # For Hudi/Delta: use spark_catalog (they prefix schema with spark_catalog.)
-        # For Iceberg/others: use the configured catalog
-        # This is critical for AuthZ (ACExtension) support where spark_catalog doesn't exist
+
+        # Prefix self.schema with the catalog for fully-qualified DDL/DML.
+        # Iceberg:    "rons.latest"         — routed through the MDS-registered catalog
+        # Hudi/Delta: "spark_catalog.latest" — routed through Spark's internal catalog
         if file_format == "iceberg":
             self.schema = self.catalog + "." + self.schema
-            self.connection_catalog = self.catalog
         elif file_format in ("delta", "hudi"):
             self.schema = "spark_catalog." + self.schema
-            self.connection_catalog = "spark_catalog"
-        else:
+
+        # connection_catalog drives PyHive's "USE `x`" on every new connection.
+        #
+        # Iceberg: use the MDS catalog name (e.g. "iceberg_data") — AuthZ (ACExtension)
+        #   checks the session catalog for permission enforcement.
+        #
+        # Hudi / Delta / hive-hadoop2 / all others: use "spark_catalog".
+        #   - "spark_catalog" is Spark's built-in internal catalog; USE `spark_catalog`
+        #     always succeeds regardless of whether the user schema exists yet.
+        #   - Using the MDS catalog name (e.g. "rons") fails because Spark treats a
+        #     single-part USE as a namespace switch under the current catalog, not a
+        #     catalog switch, raising SCHEMA_NOT_FOUND.
+        if file_format == "iceberg":
             self.connection_catalog = self.catalog
+        else:
+            self.connection_catalog = "spark_catalog"
 
     @property
     def type(self) -> str:
@@ -392,6 +403,8 @@ class PyhiveConnectionWrapper(SparkConnectionWrapper):
         """Internal method that executes SQL and polls for completion."""
         if sql.strip().endswith(";"):
             sql = sql.strip()[:-1]
+
+        logger.debug(f"Executing SQL:\n{sql}")
 
         # Reaching into the private enumeration here is bad form,
         # but there doesn't appear to be any way to determine that

@@ -236,7 +236,8 @@ class WatsonxData(Authenticator):
     def _post_request(self, url: str, data: Dict[str, Any]) -> Dict[str, Any]:
         try:
             header = {"User-Agent": USER_AGENT}
-            response = requests.post(url, json=data, headers=header, verify=False)
+            verify_ssl = not self.profile.get("suppress_ssl_warnings", True)
+            response = requests.post(url, json=data, headers=header, verify=verify_ssl)
             
             # Get the environment type for documentation links
             env_type = self._get_environment().envType if hasattr(self, "_get_environment") else None
@@ -341,7 +342,8 @@ class WatsonxData(Authenticator):
                 "User-Agent": USER_AGENT
             }
             
-            response = requests.get(url=url, headers=header, verify=False)
+            verify_ssl = not self.profile.get("suppress_ssl_warnings", True)
+            response = requests.get(url=url, headers=header, verify=verify_ssl)
             
             env_type = wxd_env.envType
             
