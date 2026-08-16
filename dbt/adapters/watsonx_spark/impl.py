@@ -485,7 +485,20 @@ class WatsonxSparkAdapter(SQLAdapter):
         if re.match(regex, string):
             return True
         return False
-    
+
+    @available
+    def get_catalog_file_format(self) -> str:
+        """Return the file format (e.g. 'iceberg', 'delta', 'hudi') of the configured catalog.
+
+        Normalises catalog API format strings to valid Spark SQL data source names:
+          'hive-hadoop2' -> 'hive'
+        """
+        creds: SparkCredentials = self.connections.get_thread_connection().credentials
+        fmt = creds.catalog_file_format or ""
+        if fmt.startswith("hive"):
+            return "hive"
+        return fmt
+
     @available.parse_none
     def set_configuration(self, config: SparkConfig) -> None:
         profile_cred: SparkCredentials = self.connections.get_thread_connection().credentials
@@ -493,7 +506,10 @@ class WatsonxSparkAdapter(SQLAdapter):
         location_root, file_format = self.get_location_format_api(profile_cred, config)
         configuration.__setitem__("location_root", location_root.replace("'", ""))
         if configuration.get("file_format") is None:
-            configuration.__setitem__("file_format", file_format)
+            # Normalise API format strings to valid Spark SQL data source names
+            # before injecting into model config (e.g. 'hive-hadoop2' -> 'hive').
+            normalised = "hive" if file_format.startswith("hive") else file_format
+            configuration.__setitem__("file_format", normalised)
         if configuration.get("catalog") is None:
             configuration.__setitem__("catalog", self.set_catalog(config))
         config.__dict__["model"].config = configuration
@@ -599,7 +615,11 @@ class WatsonxSparkAdapter(SQLAdapter):
     def check_schema_exists(self, database: str, schema: str) -> bool:
         results = self.execute_macro(LIST_SCHEMAS_MACRO_NAME, kwargs={"database": database})
 
-        exists = True if schema in [row[0] for row in results] else False
+        # For Hudi/Delta, self.schema is "spark_catalog.second" but SHOW SCHEMAS IN
+        # spark_catalog returns bare names like "second".  Strip the catalog prefix
+        # before comparison so the schema is not spuriously recreated every run.
+        bare_schema = schema.split(".")[-1] if "." in schema else schema
+        exists = True if bare_schema in [row[0] for row in results] else False
         return exists
 
     def to_agate_table(self, rows_list: List[Tuple[str, str, bool, str]]) -> agate.Table:

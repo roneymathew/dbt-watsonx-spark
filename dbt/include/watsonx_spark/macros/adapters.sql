@@ -18,8 +18,9 @@
 {%- endmacro -%}
 
 {% macro watsonx_spark__file_format_clause() %}
-  {%- set file_format = config.get('file_format', validator=validation.any[basestring]) -%}
-  {%- if file_format is not none %}
+  {%- set file_format = config.get('file_format', validator=validation.any[basestring])
+      or adapter.get_catalog_file_format() -%}
+  {%- if file_format is not none and file_format != '' %}
     using {{ file_format }}
   {%- endif %}
 {%- endmacro -%}
@@ -30,7 +31,13 @@
 {%- endmacro -%}
 
 {% macro watsonx_spark__location_clause() %}
-  {%- if adapter.should_set_location(config) -%}
+  {#--
+    Skip LOCATION for Iceberg catalogs — Iceberg manages table locations through
+    the catalog warehouse path. A custom LOCATION on an Iceberg table causes:
+    "MetaException: The location should match with the location of the catalog"
+  --#}
+  {%- set file_format = adapter.get_catalog_file_format() -%}
+  {%- if file_format != 'iceberg' and adapter.should_set_location(config) -%}
     {%- set location_root = config.get('location_root', validator=validation.any[basestring]) -%}
     {%- set identifier = model['alias'] -%}
     {%- if location_root is not none %}
@@ -140,8 +147,9 @@
 
 {#-- We can't use temporary tables with `create ... as ()` syntax --#}
 {% macro watsonx_spark__create_temporary_view(relation, compiled_code) -%}
-    create or replace temporary view {{ relation }} as
-      {{ compiled_code }}
+{{ log("[DEBUG] Creating temp view: " ~ relation.render(), info=False) }}
+    create or replace temporary view {{ relation.render() }} as
+    {{ compiled_code }}
 {%- endmacro -%}
 
 {% macro set_configuration(config) -%}
@@ -163,10 +171,10 @@
       {%- if temporary -%}
         {{ create_temporary_view(relation, compiled_code) }}
       {%- else -%}
-        {% if config.get('file_format', validator=validation.any[basestring]) in ['delta', 'iceberg'] %}
-          create or replace table {{ relation }}
+        {% if config.get('file_format', validator=validation.any[basestring]) in ['delta', 'iceberg', 'hive'] %}
+          create or replace table {{ relation.render() }}
         {% else %}
-          create table {{ relation }}
+          create table {{ relation.render() }}
         {% endif %}
         {%- set contract_config = config.get('contract') -%}
         {%- if contract_config.enforced -%}
@@ -260,7 +268,8 @@
 {% endmacro %}
 
 {% macro watsonx_spark__create_view_as(relation, sql) -%}
-  create or replace view {{ relation }}
+ {{ log("[DEBUG] Creating view: " ~ relation.render(), info=False) }}
+  create or replace view {{ relation.render() }}
   {% if config.persist_column_docs() -%}
     {% set model_columns = model.columns %}
     {% set query_columns = get_columns_in_query(sql) %}
@@ -279,29 +288,101 @@
 
 {% macro watsonx_spark__create_schema(relation) -%}
   {%- if adapter.should_create_schema() -%}
+    {%- set file_format = adapter.get_catalog_file_format() -%}
     {%- set locationPath = none -%}
-    {%- if adapter.should_set_location() -%}
-      {%- set locationPath = adapter.set_location_root(relation , config) -%}
+    {#--
+      Only add a LOCATION clause for non-Iceberg catalogs (e.g. Hudi, Delta, Hive).
+      Iceberg catalogs manage namespace locations through the catalog warehouse path —
+      passing an explicit LOCATION that doesn't match the catalog root causes:
+      "MetaException: The location should match with the location of the catalog"
+    --#}
+    {%- if file_format != 'iceberg' and adapter.should_set_location() -%}
+      {%- set locationPath = adapter.set_location_root(relation, config) -%}
     {%- endif -%}
-    
+
+    {#--
+      For Hudi/Delta, self.schema was prefixed with "spark_catalog." for Spark SQL
+      routing (e.g. "spark_catalog.second"), but MDS only knows the bare schema name.
+      Strip the prefix so CREATE SCHEMA targets the metastore correctly.
+    --#}
+    {%- if file_format in ('hudi', 'delta') -%}
+      {%- set schema_name = relation.schema.split('.')[-1] -%}
+    {%- else -%}
+      {%- set schema_name = relation.render() -%}
+    {%- endif -%}
+
     {%- call statement('create_schema') -%}
       {%- if locationPath is not none %}
-        
-        create schema if not exists {{relation}} location {{locationPath}}
-        
+        create schema if not exists {{ schema_name }} location {{locationPath}}
       {%- else %}
-        
-        create schema if not exists {{relation}}
-        
+        create schema if not exists {{ schema_name }}
       {%- endif -%}
     {% endcall %}
   {%- endif -%}
 {% endmacro %}
 
+{% macro drop_schema(relation) -%}
+  {{ return(adapter.dispatch('drop_schema', 'dbt')(relation)) }}
+{%- endmacro %}
+
 {% macro watsonx_spark__drop_schema(relation) -%}
+  {#
+    For Iceberg catalogs, we must drop all tables before dropping the schema.
+    Iceberg doesn't support CASCADE properly and will fail if tables exist.
+
+    Use adapter.get_catalog_file_format() rather than dot-in-schema heuristics so
+    that Hudi/Delta schemas (which also use "spark_catalog.schema") are not incorrectly
+    treated as Iceberg.
+  #}
+  {%- set file_format = adapter.get_catalog_file_format() -%}
+  {%- set is_iceberg = file_format == 'iceberg' -%}
+
+  {{ log("[DROP_SCHEMA] Starting drop_schema for relation: " ~ relation, info=False) }}
+  {{ log("[DROP_SCHEMA] relation.database: " ~ relation.database, info=False) }}
+  {{ log("[DROP_SCHEMA] relation.schema: " ~ relation.schema, info=False) }}
+
+  {# Build the full schema name with catalog #}
+  {%- if relation.database -%}
+    {%- set full_schema_name = relation.database ~ '.' ~ relation.schema -%}
+  {%- else -%}
+    {%- set full_schema_name = relation.schema -%}
+  {%- endif -%}
+
+  {{ log("[DROP_SCHEMA] is_iceberg: " ~ is_iceberg ~ ", full_schema_name: " ~ full_schema_name, info=False) }}
+
+  {# For Iceberg: drop all tables first because CASCADE is not supported #}
+  {% if is_iceberg %}
+    {{ log("[DROP_SCHEMA] Iceberg catalog detected - will drop tables first", info=False) }}
+
+    {%- set schema_relation = adapter.Relation.create(database=none, schema=full_schema_name) -%}
+    {{ log("[DROP_SCHEMA] Created schema_relation for listing: " ~ schema_relation, info=False) }}
+
+    {%- set tables_in_schema = adapter.list_relations_without_caching(schema_relation) -%}
+    {{ log("[DROP_SCHEMA] Found " ~ tables_in_schema|length ~ " relations to drop", info=False) }}
+
+    {% for table in tables_in_schema %}
+      {{ log("[DROP_SCHEMA] Dropping " ~ table.type ~ ": " ~ table, info=False) }}
+      {%- call statement('drop_relation_' ~ loop.index, auto_begin=False) -%}
+        drop {{ table.type }} if exists {{ table }}
+      {%- endcall -%}
+    {% endfor %}
+
+    {{ log("[DROP_SCHEMA] Finished dropping all relations", info=False) }}
+  {% else %}
+    {{ log("[DROP_SCHEMA] Non-Iceberg format (" ~ file_format ~ ") - will use CASCADE", info=False) }}
+  {% endif %}
+
+  {# Drop the schema; use CASCADE for non-Iceberg formats #}
+  {{ log("[DROP_SCHEMA] Now dropping schema: " ~ full_schema_name ~ " (CASCADE: " ~ (not is_iceberg) ~ ")", info=False) }}
   {%- call statement('drop_schema') -%}
-    drop schema if exists {{ relation }} cascade
+    {% if is_iceberg %}
+      drop schema if exists {{ full_schema_name }}
+    {% else %}
+      drop schema if exists {{ full_schema_name }} cascade
+    {% endif %}
   {%- endcall -%}
+
+  {{ log("[DROP_SCHEMA] Completed drop_schema", info=False) }}
 {% endmacro %}
 
 {% macro get_columns_in_relation_raw(relation) -%}
@@ -323,9 +404,28 @@
 {% endmacro %}
 
 {% macro watsonx_spark__list_relations_without_caching(relation) %}
-  {% call statement('list_relations_without_caching', fetch_result=True) -%}
+  {#--
+    For catalog-based schemas (Iceberg, Delta, Hudi), the schema already contains
+    the catalog prefix (e.g., "iceberg_data.schema" or "spark_catalog.schema").
+    These use v2 tables which don't support SHOW TABLE EXTENDED.
+    
+    Detection: If schema contains a dot, it has a catalog prefix -> use SHOW TABLES
+    Otherwise: Traditional Hive -> use SHOW TABLE EXTENDED
+  --#}
+  {%- set has_catalog = '.' in relation.schema -%}
+  
+  {% if has_catalog %}
+    {#-- Catalog-based schema (Iceberg/Delta/Hudi) - use SHOW TABLES --#}
+    {% call statement('list_relations_without_caching', fetch_result=True) -%}
+      show tables in {{ relation.schema }} like '*'
+    {% endcall %}
+  {% else %}
+    {#-- Traditional Hive schema - use SHOW TABLE EXTENDED --#}
+    {% call statement('list_relations_without_caching', fetch_result=True) -%}
       show table extended in {{ relation.schema }} like '*'
-  {% endcall %}
+    {% endcall %}
+  {% endif %}
+  
   {% do return(load_result('list_relations_without_caching').table) %}
 {% endmacro %}
 
@@ -334,6 +434,10 @@
   {#-- Spark with iceberg tables don't work with show table extended for #}
   {#-- V2 iceberg tables #}
   {#-- https://issues.apache.org/jira/browse/SPARK-33393 #}
+  {%- set sql_query = "show tables in " ~ schema_relation.schema ~ " like '*'" -%}
+  {{ log("[MACRO] list_relations_show_tables_without_caching SQL: " ~ sql_query, info=False) }}
+  {{ log("[MACRO] schema_relation.schema = " ~ schema_relation.schema, info=False) }}
+  {{ log("[MACRO] schema_relation object = " ~ schema_relation, info=False) }}
   {% call statement('list_relations_without_caching_show_tables', fetch_result=True) -%}
     show tables in {{ schema_relation.schema }} like '*'
   {% endcall %}
@@ -345,15 +449,47 @@
   {#-- Spark with iceberg tables don't work with show table extended for #}
   {#-- V2 iceberg tables #}
   {#-- https://issues.apache.org/jira/browse/SPARK-33393 #}
+  {#-- Table name is already quoted in Python (impl.py) to handle special characters #}
+  {#-- Try DESCRIBE EXTENDED first (works for non-v2, provides more metadata) #}
+  {#-- Python code will fallback to describe_table_without_caching if this fails #}
   {% call statement('describe_table_extended_without_caching', fetch_result=True) -%}
     describe extended {{ table_name }}
   {% endcall %}
   {% do return(load_result('describe_table_extended_without_caching').table) %}
 {% endmacro %}
 
+{% macro describe_table_without_caching(table_name) %}
+  {#-- Fallback for Iceberg v2 tables where DESCRIBE EXTENDED fails #}
+  {#-- DESCRIBE TABLE (without EXTENDED) works for v2 tables #}
+  {#-- Table name is already quoted in Python (impl.py) to handle special characters #}
+  {% call statement('describe_table_without_caching', fetch_result=True) -%}
+    describe table {{ table_name }}
+  {% endcall %}
+  {% do return(load_result('describe_table_without_caching').table) %}
+{% endmacro %}
+
 {% macro watsonx_spark__list_schemas(database) -%}
+  {%- set file_format = adapter.get_catalog_file_format() -%}
   {% call statement('list_schemas', fetch_result=True, auto_begin=False) %}
-    show databases
+    {%- if file_format in ('hudi', 'delta') -%}
+      {#--
+        Hudi/Delta: schemas live under Spark's internal spark_catalog.
+        SHOW SCHEMAS IN spark_catalog lists them correctly.
+      --#}
+      show schemas in spark_catalog
+    {%- elif file_format == 'iceberg' -%}
+      {#--
+        Iceberg: schemas are namespaces under the MDS-registered catalog.
+        SHOW SCHEMAS IN <catalog> lists them.
+      --#}
+      show schemas in {{ adapter.config.credentials.catalog }}
+    {%- else -%}
+      {#--
+        hive-hadoop2 and other legacy formats: schemas are plain Hive databases.
+        SHOW DATABASES lists all of them; no catalog prefix needed or supported.
+      --#}
+      show databases
+    {%- endif %}
   {% endcall %}
   {{ return(load_result('list_schemas').table) }}
 {% endmacro %}
@@ -374,7 +510,8 @@
 
 {% macro watsonx_spark__drop_relation(relation) -%}
   {% call statement('drop_relation', auto_begin=False) -%}
-    drop {{ relation.type }} if exists {{ relation }}
+    {{ log("[DEBUG] Dropping " ~ relation.type ~ ": " ~ relation.render(), info=False) }}
+    drop {{ relation.type }} if exists {{ relation.render() }}
   {%- endcall %}
 {% endmacro %}
 
@@ -417,7 +554,19 @@
         "identifier": tmp_identifier
     }) -%}
 
-    {%- set tmp_relation = tmp_relation.include(database=false, schema=false) -%}
+    {# 
+       Check if the base relation has a database (catalog) component.
+       - If yes: It's a 3-part name (Iceberg/watsonx.data), force inclusion.
+       - If no: It's a 2-part name (Hive/Hudi/Delta on spark_catalog), use 1-part identifier.
+    #}
+    {%- if base_relation.database -%}
+        {{ log("[DEBUG] 3-Part Name Detected. Catalog: " ~ base_relation.database ~ ". Forcing full inclusion.", info=False) }}
+        {%- set tmp_relation = tmp_relation.include(database=True, schema=True) -%}
+    {%- else -%}
+        {{ log("[DEBUG] 2-Part Name Detected. Using 1-part identifier for temp relation.", info=False) }}
+        {%- set tmp_relation = tmp_relation.include(database=False, schema=False) -%}
+    {%- endif -%}
+    
     {% do return(tmp_relation) %}
 {% endmacro %}
 

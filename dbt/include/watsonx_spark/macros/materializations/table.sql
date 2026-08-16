@@ -15,16 +15,19 @@
   -- in case if the existing and future table is delta or iceberg, we want to do a
   -- create or replace table instead of dropping, so we don't have the table unavailable
   {% if old_relation is not none %}
-    {% set is_delta = (old_relation.is_delta and config.get('file_format', validator=validation.any[basestring]) == 'delta') %}
-    {% set is_iceberg = (old_relation.is_iceberg and config.get('file_format', validator=validation.any[basestring]) == 'iceberg') %}
+    {% set file_fmt = config.get('file_format', validator=validation.any[basestring]) %}
+    {% set is_delta = (old_relation.is_delta and file_fmt == 'delta') %}
+    {% set is_iceberg = (old_relation.is_iceberg and file_fmt == 'iceberg') %}
+    {% set is_hive = (file_fmt == 'hive') %}
     {% set old_relation_type = old_relation.type %}
   {% else %}
     {% set is_delta = false %}
     {% set is_iceberg = false %}
+    {% set is_hive = false %}
     {% set old_relation_type = target_relation.type %}
   {% endif %}
 
-  {% if not is_delta and not is_iceberg %}
+  {% if not is_delta and not is_iceberg and not is_hive %}
     {% set existing_relation = target_relation %}
     {{ adapter.drop_relation(existing_relation.incorporate(type=old_relation_type)) }}
   {% endif %}

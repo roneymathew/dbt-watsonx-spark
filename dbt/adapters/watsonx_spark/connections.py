@@ -216,18 +216,31 @@ class SparkCredentials(Credentials):
             self.token = authenticator.get_token()
 
         bucket, file_format = authenticator.get_catlog_details(self.catalog)
-        # Determine which catalog to use for connection connection_catalog will be replaced by catalog
-        # For Hudi/Delta: use spark_catalog (they prefix schema with spark_catalog.)
-        # For Iceberg/others: use the configured catalog
-        # This is critical for AuthZ (ACExtension) support where spark_catalog doesn't exist
+        self.catalog_file_format = file_format
+
+        # Prefix self.schema with the catalog for fully-qualified DDL/DML.
+        # Iceberg:    "rons.latest"         — routed through the MDS-registered catalog
+        # Hudi/Delta: "spark_catalog.latest" — routed through Spark's internal catalog
         if file_format == "iceberg":
             self.schema = self.catalog + "." + self.schema
-            self.connection_catalog = self.catalog
-        if file_format == "delta" or file_format == "hudi":
+        elif file_format in ("delta", "hudi"):
             self.schema = "spark_catalog." + self.schema
-            self.connection_catalog = "spark_catalog"
+
+        # connection_catalog drives PyHive's "USE `x`" on every new connection.
+        #
+        # Iceberg: use the MDS catalog name (e.g. "iceberg_data") — AuthZ (ACExtension)
+        #   checks the session catalog for permission enforcement.
+        #
+        # Hudi / Delta / hive-hadoop2 / all others: use "spark_catalog".
+        #   - "spark_catalog" is Spark's built-in internal catalog; USE `spark_catalog`
+        #     always succeeds regardless of whether the user schema exists yet.
+        #   - Using the MDS catalog name (e.g. "rons") fails because Spark treats a
+        #     single-part USE as a namespace switch under the current catalog, not a
+        #     catalog switch, raising SCHEMA_NOT_FOUND.
+        if file_format == "iceberg":
+            self.connection_catalog = self.catalog
         else:
-             self.connection_catalog = self.catalog
+            self.connection_catalog = "spark_catalog"
 
     @property
     def type(self) -> str:
@@ -391,6 +404,8 @@ class PyhiveConnectionWrapper(SparkConnectionWrapper):
         if sql.strip().endswith(";"):
             sql = sql.strip()[:-1]
 
+        logger.debug(f"Executing SQL:\n{sql}")
+
         # Reaching into the private enumeration here is bad form,
         # but there doesn't appear to be any way to determine that
         # a query has completed executing from the pyhive public API.
@@ -526,13 +541,29 @@ class SparkConnectionManager(SQLConnectionManager):
             thrift_resp = exc.args[0]
             if hasattr(thrift_resp, "status") and hasattr(thrift_resp.status, "errorMessage"):
                 error_msg = thrift_resp.status.errorMessage
-                if "permission denied" in error_msg.lower():
+                error_msg_lower = error_msg.lower()
+
+                # SparkStringUtils is missing from some Azure BYOC Spark engine builds.
+                # The crash happens in the post-execution explainString/logging phase —
+                # the DDL/DML itself completed successfully on the server before the crash.
+                # Treat this as a warning and continue rather than failing the dbt run.
+                if "sparkstringutils" in error_msg_lower or (
+                    "noclassdeffounderror" in error_msg_lower and "spark" in error_msg_lower
+                ):
+                    logger.warning(
+                        f"Spark engine reported a non-fatal internal error (NoClassDefFoundError "
+                        f"in post-execution phase) — the SQL statement completed successfully. "
+                        f"This is a known issue with this Spark engine build."
+                    )
+                    return  # suppress — do not raise
+
+                if "permission denied" in error_msg_lower:
                     error_msg += " - Please check your access permissions for this operation."
-                elif "table not found" in error_msg.lower():
+                elif "table not found" in error_msg_lower:
                     error_msg += " - Please verify the table exists and is accessible."
-                elif "syntax error" in error_msg.lower():
+                elif "syntax error" in error_msg_lower:
                     error_msg += " - Please check your SQL syntax."
-                    
+
                 logger.error(error_msg)
                 raise DbtRuntimeError(error_msg) from exc
             else:

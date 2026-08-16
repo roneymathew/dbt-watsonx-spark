@@ -22,6 +22,7 @@ from dbt.adapters.watsonx_spark.http_auth.status_codes import StatusCodeHandler
 
 CPD = "CPD"
 SAAS = "SASS"
+SAAS_AZURE = "SAAS_AZURE"
 DEFAULT_SASS_URI_VERSION = "v2"
 CPD_AUTH_ENDPOINT = "/icp4d-api/v1/authorize"
 CPD_AUTH_HEADER = "LhInstanceId"
@@ -57,7 +58,8 @@ class WatsonxData(Authenticator):
         self.instance = profile.get("instance")
         self.user = profile.get("user")
         self.apikey = profile.get("apikey")
-        self.host = host
+        self.host = host          # may be redirected to CP host for Azure BYOC auth
+        self._lakehouse_host = host  # always the original lakehouse host
         self.uri = uri
         
         # Conditionally suppress SSL warnings based on profile setting
@@ -78,6 +80,18 @@ class WatsonxData(Authenticator):
             or DEFAULT_SASS_URI_VERSION
         )
         self.sass_auth_endpoint = f"/lakehouse/api/{self.lakehouse_version}/auth/authenticate"
+        # Azure BYOC: auth is done against the Control Plane (CP) URL, not the lakehouse host.
+        # The CP URL is discovered via GET <host>/lakehouse/api/<ver>/<instance_guid>/cp_endpoint.
+        self._cp_url: Optional[str] = None
+        self._instance_guid: Optional[str] = self._extract_instance_guid_from_crn(
+            profile.get("instance", "")
+        )
+
+        # For Azure BYOC, resolve and cache the CP URL once at init time so every subsequent
+        # call to get_token() / _get_headers() / get_catlog_details() reuses the cached value
+        # instead of issuing a discovery HTTP request on each invocation.
+        if self._is_azure_byoc():
+            self.host = self._get_cp_url()
 
     def _extract_version_from_uri(self, uri: str) -> Optional[str]:
         """
@@ -87,8 +101,79 @@ class WatsonxData(Authenticator):
         m = self.VERSION_REGEX.search(uri)
         return m.group(1) if m else None
 
+    def _extract_instance_guid_from_crn(self, crn: str) -> Optional[str]:
+        """
+        Extracts the instance GUID from a CRN string.
+        CRN format: crn:version:cname:ctype:service:region:scope:service-instance:resource-type:resource
+        The service-instance segment (index 7) holds the GUID, e.g.:
+          crn:v1:azure-staging:public:lakehouse:eastus:sub/...:20260709-1328-1753-820b-d86de880ece4::
+        Returns None if not found or CRN is not well-formed.
+        """
+        if not crn:
+            return None
+        parts = crn.split(":")
+        # segment 7 is the service-instance GUID
+        if len(parts) > 7 and parts[7]:
+            return parts[7]
+        return None
+
+    def _is_azure_byoc(self) -> bool:
+        """
+        Returns True when the CRN identifies an Azure BYOC (Bring Your Own Cloud) deployment.
+        Azure BYOC CRNs contain 'azure' as the cloud provider segment (index 2), e.g.:
+          crn:v1:azure-staging:public:lakehouse:eastus:...
+          crn:v1:azure:public:lakehouse:eastus:...
+        """
+        if not self.instance:
+            return False
+        parts = self.instance.split(":")
+        if len(parts) >= 3:
+            return parts[2].lower().startswith("azure")
+        return False
+
+    def _get_cp_url(self) -> str:
+        """
+        Fetches the Control Plane (CP) hostname for Azure BYOC from the lakehouse host.
+        Calls GET <host>/lakehouse/api/<ver>/cp_endpoint which returns a plain-text hostname,
+        e.g. "console-azure-canadacentral.lakehouse.dev.saas.ibm.com"
+        Result is cached for the lifetime of this authenticator instance.
+        """
+        if self._cp_url:
+            return self._cp_url
+
+        url = f"{self._lakehouse_host}/lakehouse/api/{self.lakehouse_version}/cp_endpoint"
+        logger.debug(f"Fetching Azure BYOC control plane URL from: {url}")
+        try:
+            verify_ssl = not self.profile.get("suppress_ssl_warnings", True)
+            response = requests.get(url, headers={"User-Agent": USER_AGENT}, verify=verify_ssl)
+            response.raise_for_status()
+            # Response is plain-text hostname, e.g. "console-azure-canadacentral.lakehouse.dev.saas.ibm.com"
+            hostname = response.text.strip().strip('"').rstrip("%")
+            if not hostname:
+                raise TokenRetrievalError(
+                    message=f"cp_endpoint returned an empty response"
+                )
+            # Ensure it has an https:// scheme
+            if not hostname.startswith("http"):
+                hostname = "https://" + hostname
+            self._cp_url = hostname.rstrip("/")
+            logger.debug(f"Azure BYOC control plane URL: {self._cp_url}")
+            return self._cp_url
+        except requests.exceptions.RequestException as err:
+            raise TokenRetrievalError(
+                message=f"Failed to fetch Azure BYOC cp_endpoint: {err}"
+            )
+
     def _get_environment(self) -> WatsonxDataEnv:
-        if "crn" in self.instance:
+        if self.instance and "crn" in self.instance:
+            if self._is_azure_byoc():
+                # Azure BYOC: self.host was already set to the CP host in __init__.
+                # _lakehouse_host retains the original host for catalog/Thrift calls.
+                auth_endpoint = (
+                    f"/lakehouse/api/{self.lakehouse_version}"
+                    f"/{self._instance_guid}/auth/authenticate"
+                )
+                return WatsonxDataEnv(SAAS_AZURE, auth_endpoint, SASS_AUTH_HEADER)
             return WatsonxDataEnv(SAAS, self.sass_auth_endpoint, SASS_AUTH_HEADER)
         else:
             return WatsonxDataEnv(CPD, CPD_AUTH_ENDPOINT, CPD_AUTH_HEADER)
@@ -151,7 +236,8 @@ class WatsonxData(Authenticator):
     def _post_request(self, url: str, data: Dict[str, Any]) -> Dict[str, Any]:
         try:
             header = {"User-Agent": USER_AGENT}
-            response = requests.post(url, json=data, headers=header, verify=False)
+            verify_ssl = not self.profile.get("suppress_ssl_warnings", True)
+            response = requests.post(url, json=data, headers=header, verify=verify_ssl)
             
             # Get the environment type for documentation links
             env_type = self._get_environment().envType if hasattr(self, "_get_environment") else None
@@ -218,7 +304,9 @@ class WatsonxData(Authenticator):
         try:
             if wxd_env.envType == CPD:
                 return self._get_cpd_token(wxd_env)
-            elif wxd_env.envType == SAAS:
+            elif wxd_env.envType in (SAAS, SAAS_AZURE):
+                # Both SaaS and Azure BYOC use the same token format.
+                # For BYOC, self.host is redirected to the CP host inside _get_environment().
                 return self._get_sass_token(wxd_env)
             else:
                 error_msg = f"Unknown environment type: {wxd_env.envType}"
@@ -235,7 +323,10 @@ class WatsonxData(Authenticator):
 
     def get_catlog_details(self, catalog_name: str) -> Tuple[str, str]:
         wxd_env = self._get_environment()
-        url = f"{self.host}/lakehouse/api/{self.lakehouse_version}/catalogs/{catalog_name}"
+        # For Azure BYOC the catalog API is on the CP host (same as auth).
+        # For all others use the original lakehouse host.
+        api_host = self.host if wxd_env.envType == SAAS_AZURE else self._lakehouse_host
+        url = f"{api_host}/lakehouse/api/{self.lakehouse_version}/catalogs/{catalog_name}"
         
         try:
             result = self._get_token(wxd_env)
@@ -251,7 +342,8 @@ class WatsonxData(Authenticator):
                 "User-Agent": USER_AGENT
             }
             
-            response = requests.get(url=url, headers=header, verify=False)
+            verify_ssl = not self.profile.get("suppress_ssl_warnings", True)
+            response = requests.get(url=url, headers=header, verify=verify_ssl)
             
             env_type = wxd_env.envType
             
