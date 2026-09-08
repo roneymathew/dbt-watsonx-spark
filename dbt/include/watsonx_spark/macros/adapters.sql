@@ -287,7 +287,7 @@
 {% endmacro %}
 
 {% macro watsonx_spark__create_schema(relation) -%}
-  {%- if adapter.should_create_schema() -%}
+  {%- if adapter.should_create_schema(config) -%}
     {%- set file_format = adapter.get_catalog_file_format() -%}
     {%- set locationPath = none -%}
     {#--

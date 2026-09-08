@@ -1,6 +1,9 @@
 import unittest
+from types import SimpleNamespace
 from unittest import mock
+
 from dbt.adapters.watsonx_spark.connections import SparkCredentials
+from dbt.adapters.watsonx_spark.impl import WatsonxSparkAdapter
 
 
 class TestCreateSchemasFlag(unittest.TestCase):
@@ -50,6 +53,16 @@ class TestCreateSchemasFlag(unittest.TestCase):
             create_schemas=True,
         )
         self.assertTrue(creds.create_schemas)
+
+
+    def test_project_level_create_schemas_is_used_when_model_config_is_unavailable(self):
+        adapter = object.__new__(WatsonxSparkAdapter)
+        adapter.config = SimpleNamespace(
+            project_name="test_project",
+            models={"test_project": {"+create_schemas": False}},
+        )
+
+        self.assertFalse(adapter.should_create_schema())
 
 
 if __name__ == "__main__":

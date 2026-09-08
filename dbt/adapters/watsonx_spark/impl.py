@@ -376,9 +376,24 @@ class WatsonxSparkAdapter(SQLAdapter):
         Configuration hierarchy: model config → profile config → adapter default (True)
         """
         # Check model-level config first
-        if config is not None and "create_schemas" in config:
-            return bool(config.get("create_schemas"))
-        
+        if config is not None:
+            config_value = (
+                config.get("create_schemas")
+                if hasattr(config, "get")
+                else getattr(config, "create_schemas", None)
+            )
+            if config_value is not None:
+                return bool(config_value)
+
+        # dbt invokes adapter.create_schema() before executing individual models,
+        # so no model config is available at that point. Honor the project's
+        # top-level models.<project_name> configuration here.
+        project_models = getattr(self.config, "models", {})
+        project_config = project_models.get(self.config.project_name, {})
+        project_value = project_config.get("+create_schemas")
+        if project_value is not None:
+            return bool(project_value)
+
         # Fall back to profile-level config
         creds = self._get_active_credentials()
         profile_value = getattr(creds, "create_schemas", None)
