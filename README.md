@@ -60,7 +60,7 @@ dbt_wxd:
 
       # Optional: Control automatic LOCATION clause in CREATE TABLE (default: true)
       # Set to false if table locations are managed externally or to avoid permission issues
-      auto_location: false
+      auto_location: true
 
       auth:
         # In case of SaaS, set it as CRN of watsonx.data service
@@ -118,7 +118,7 @@ When `create_schemas` is set to `false`, dbt will skip schema creation and assum
 - You need to prevent accidental schema creation in production environments
 #### Table Location Control
 
-By default, dbt-watsonx-spark automatically adds a LOCATION clause when creating tables based on the `location_root` configuration. However, in some environments where table locations are managed externally or to avoid S3 permission issues, you may want to disable this behavior.
+By default, dbt-watsonx-spark automatically adds a LOCATION clause when creating tables based on the `location_root` configuration. In environments where table locations are managed externally or to avoid S3 permission issues, you may want to disable this behavior.
 
 You can control automatic location setting at three levels:
 
@@ -152,7 +152,7 @@ models:
       +auto_location: false  # Disable for specific folder
 ```
 
-When `auto_location` is set to `false`, dbt will not add a LOCATION clause to CREATE TABLE statements, allowing the database to use its default location or a location specified by external schema management. This is useful when:
+When `auto_location` is set to `false`, dbt does not add a LOCATION clause to CREATE TABLE statements. Schema creation still uses the configured or catalog-derived `location_root`, because schemas require an explicit location. This allows Spark to derive table locations from the schema location. This is useful when:
 - Table locations are managed by an external automation or Ops team
 - You want to avoid S3 permission issues related to specific paths
 - The schema already has a default location configured

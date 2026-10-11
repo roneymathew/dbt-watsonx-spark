@@ -414,9 +414,9 @@ class WatsonxSparkAdapter(SQLAdapter):
             logger.info(f"LOCATION clause {'enabled' if result else 'disabled'} (auto_location from profile config)")
             return result
         
-        # Default to False (no LOCATION clause)
-        logger.info("LOCATION clause disabled (auto_location default)")
-        return False
+        # Default to True (add LOCATION clause)
+        logger.info("LOCATION clause enabled (auto_location default)")
+        return True
 
 
     def create_schema(self, relation: SparkRelation) -> None:
@@ -433,9 +433,6 @@ class WatsonxSparkAdapter(SQLAdapter):
 
     @available.parse_none
     def set_location_root(self, relation: SparkRelation, config: SparkConfig) -> Optional[str]:
-        if not self.should_set_location(config):
-            return None
-
         profile_cred: SparkCredentials = self.connections.get_thread_connection().credentials
         profile_location_root = self.validate_location(profile_cred.location_root)
         model_location_root = self.validate_location(config.get("location_root"))
@@ -450,7 +447,8 @@ class WatsonxSparkAdapter(SQLAdapter):
         
         api_location = self.ConnectionManager.get_location_from_api(profile_cred)
         if api_location is not None:
-            location_root, _ = self.get_location_format_api(profile_cred, config)
+            bucket, _ = api_location
+            location_root = self.build_location(bucket, self.set_catalog(config), relation.schema)
             relation.set_location(location_root)
             return location_root
         return None
@@ -477,8 +475,7 @@ class WatsonxSparkAdapter(SQLAdapter):
         return None
 
     def build_location(self, bucket: str, catalog: str, schema: str) -> str:
-        if "." in schema:
-            schema = schema.split(".")[1]
+        schema = schema.split(".")[-1]
         return f"'s3a://{bucket}/{catalog}/{schema}'"
 
     def check_regex(self, regex: Any, string: str) -> bool:
@@ -504,7 +501,13 @@ class WatsonxSparkAdapter(SQLAdapter):
         profile_cred: SparkCredentials = self.connections.get_thread_connection().credentials
         configuration = config.__dict__["model"].config
         location_root, file_format = self.get_location_format_api(profile_cred, config)
-        configuration.__setitem__("location_root", location_root.replace("'", ""))
+
+        if configuration.get("location_root") is None:
+            if profile_cred.location_root is not None:
+                configuration.__setitem__("location_root", profile_cred.location_root)
+            elif self.should_set_location(config):
+                configuration.__setitem__("location_root", location_root.replace("'", ""))
+
         if configuration.get("file_format") is None:
             # Normalise API format strings to valid Spark SQL data source names
             # before injecting into model config (e.g. 'hive-hadoop2' -> 'hive').

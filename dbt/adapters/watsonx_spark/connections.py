@@ -113,7 +113,7 @@ class SparkCredentials(Credentials):
     location_root: Optional[str] = None
     catalog: Optional[str] = None
     create_schemas: bool = True
-    auto_location: bool = False
+    auto_location: bool = True
     suppress_ssl_warnings: bool = True
     connection_catalog: Optional[str] = "default"
     # Query execution parameters

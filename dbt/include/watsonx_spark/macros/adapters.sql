@@ -37,12 +37,10 @@
     "MetaException: The location should match with the location of the catalog"
   --#}
   {%- set file_format = adapter.get_catalog_file_format() -%}
-  {%- if file_format != 'iceberg' and adapter.should_set_location(config) -%}
-    {%- set location_root = config.get('location_root', validator=validation.any[basestring]) -%}
-    {%- set identifier = model['alias'] -%}
-    {%- if location_root is not none %}
-      location '{{ location_root }}/{{ identifier }}'
-    {%- endif %}
+  {%- set location_root = config.get('location_root', validator=validation.any[basestring]) -%}
+  {%- set identifier = model['alias'] -%}
+  {%- if file_format != 'iceberg' and location_root is not none -%}
+    location '{{ location_root }}/{{ identifier }}'
   {%- endif -%}
 {%- endmacro -%}
 
@@ -296,7 +294,7 @@
       passing an explicit LOCATION that doesn't match the catalog root causes:
       "MetaException: The location should match with the location of the catalog"
     --#}
-    {%- if file_format != 'iceberg' and adapter.should_set_location() -%}
+    {%- if file_format != 'iceberg' -%}
       {%- set locationPath = adapter.set_location_root(relation, config) -%}
     {%- endif -%}
 

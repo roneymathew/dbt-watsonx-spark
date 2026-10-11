@@ -25,12 +25,18 @@ class TestSparkMacros(unittest.TestCase):
         self.default_context["config"].get = lambda key, default=None, **kwargs: self.config.get(
             key, default
         )
+        self.default_context["adapter"].should_set_location = lambda config=None: bool(
+            self.config.get("auto_location", False)
+        )
+        self.default_context["adapter"].get_catalog_file_format.return_value = ""
 
     def __get_template(self, template_filename):
         return self.jinja_env.get_template(template_filename, globals=self.default_context)
 
     def __run_macro(self, template, name, temporary, relation, sql):
         self.default_context["model"].alias = relation
+        relation_obj = mock.Mock()
+        relation_obj.render.return_value = relation
 
         def dispatch(macro_name, macro_namespace=None, packages=None):
             return getattr(template.module, f"watsonx_spark__{macro_name}")
@@ -38,7 +44,7 @@ class TestSparkMacros(unittest.TestCase):
         self.default_context["adapter"].dispatch = dispatch
 
         value = getattr(template.module, name)(
-            temporary, relation, sql, self.default_context["config"]
+            temporary, relation_obj, sql, self.default_context["config"]
         )
         return re.sub(r"\s\s+", " ", value)
 
@@ -167,6 +173,7 @@ class TestSparkMacros(unittest.TestCase):
     def test_macros_create_table_as_location(self):
         template = self.__get_template("adapters.sql")
 
+        self.config["auto_location"] = True
         self.config["location_root"] = "/mnt/root"
         sql = self.__run_macro(
             template, "watsonx_spark__create_table_as", False, "my_table", "select 1"
@@ -186,6 +193,7 @@ class TestSparkMacros(unittest.TestCase):
     def test_macros_create_table_as_all(self):
         template = self.__get_template("adapters.sql")
 
+        self.config["auto_location"] = True
         self.config["file_format"] = "delta"
         self.config["location_root"] = "/mnt/root"
         self.config["partition_by"] = ["partition_1", "partition_2"]
